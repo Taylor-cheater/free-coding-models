@@ -96,7 +96,15 @@ import { request as httpsRequest } from 'https'
 import { MODELS, sources } from '../sources.js'
 import { patchOpenClawModelsJson } from '../patch-openclaw-models.js'
 import { getAvg, getVerdict, getUptime, getP95, getJitter, getStabilityScore, sortResults, filterByTier, findBestModel, parseArgs, TIER_ORDER, VERDICT_ORDER, TIER_LETTER_MAP, scoreModelForTask, getTopRecommendations, TASK_TYPES, PRIORITY_TYPES, CONTEXT_BUDGETS, formatCtxWindow, labelFromId } from '../lib/utils.js'
-import { loadConfig, saveConfig, getApiKey, isProviderEnabled, saveAsProfile, loadProfile, listProfiles, deleteProfile, getActiveProfileName, setActiveProfile, _emptyProfileSettings } from '../lib/config.js'
+import { loadConfig, saveConfig, getApiKey, resolveApiKeys, isProviderEnabled, saveAsProfile, loadProfile, listProfiles, deleteProfile, getActiveProfileName, setActiveProfile, _emptyProfileSettings } from '../lib/config.js'
+import { buildMergedModels } from '../lib/model-merger.js'
+import { ProxyServer } from '../lib/proxy-server.js'
+import { loadOpenCodeConfig, saveOpenCodeConfig, syncToOpenCode, restoreOpenCodeBackup } from '../lib/opencode-sync.js'
+
+// 📖 mergedModels: cross-provider grouped model list (one entry per label, N providers each)
+// 📖 mergedModelByLabel: fast lookup map from display label → merged model entry
+const mergedModels = buildMergedModels(MODELS)
+const mergedModelByLabel = new Map(mergedModels.map(m => [m.label, m]))
 
 const require = createRequire(import.meta.url)
 const readline = require('readline')
@@ -735,6 +743,13 @@ function stripAnsi(input) {
   return String(input).replace(/\x1b\[[0-9;]*m/g, '').replace(/\x1b\][^\x1b]*\x1b\\/g, '')
 }
 
+// 📖 maskApiKey: Mask all but first 4 and last 3 characters of an API key.
+// 📖 Prevents accidental disclosure of secrets in TUI display.
+function maskApiKey(key) {
+  if (!key || key.length < 10) return '***'
+  return key.slice(0, 4) + '***' + key.slice(-3)
+}
+
 // 📖 Calculate display width of a string in terminal columns.
 // 📖 Emojis and other wide characters occupy 2 columns, variation selectors (U+FE0F) are zero-width.
 // 📖 This avoids pulling in a full `string-width` dependency for a lightweight CLI tool.
@@ -1033,9 +1048,18 @@ function renderTable(results, pendingPings, frame, cursor = null, sortColumn = '
     // 📖 Left-aligned columns - pad plain text first, then colorize
     const num = chalk.dim(String(r.idx).padEnd(W_RANK))
     const tier = tierFn(r.tier.padEnd(W_TIER))
-    // 📖 Show provider name from sources map (NIM / Groq / Cerebras)
+    // 📖 Show provider count for merged (multi-provider) models, or single provider name
+    const merged = mergedModelByLabel.get(r.label)
+    const providerCount = merged ? merged.providerCount : 1
     const providerName = sources[r.providerKey]?.name ?? r.providerKey ?? 'NIM'
-    const source = chalk.green(providerName.padEnd(W_SOURCE))
+    let source
+    if (providerCount >= 3) {
+      source = chalk.green((`${providerCount} providers`).padEnd(W_SOURCE))
+    } else if (providerCount === 2) {
+      source = chalk.yellow((`${providerCount} providers`).padEnd(W_SOURCE))
+    } else {
+      source = chalk.green(providerName.padEnd(W_SOURCE))
+    }
     // 📖 Favorites: always reserve 2 display columns at the start of Model column.
     // 📖 🎯 (2 cols) for recommended, ⭐ (2 cols) for favorites, '  ' (2 spaces) for non-favorites — keeps alignment stable.
     const favoritePrefix = r.isRecommended ? '🎯' : r.isFavorite ? '⭐' : '  '
@@ -1217,7 +1241,8 @@ function renderTable(results, pendingPings, frame, cursor = null, sortColumn = '
 
     // 📖 When cursor is on this row, render Model and Origin in bright white for readability
     const nameCell = isCursor ? chalk.white.bold(favoritePrefix + r.label.slice(0, nameWidth).padEnd(nameWidth)) : name
-    const sourceCell = isCursor ? chalk.white.bold(providerName.padEnd(W_SOURCE)) : source
+    const sourceCursorText = providerCount > 1 ? (`${providerCount} providers`).padEnd(W_SOURCE) : providerName.padEnd(W_SOURCE)
+    const sourceCell = isCursor ? chalk.white.bold(sourceCursorText) : source
 
     // 📖 Build row with double space between columns (order: Rank, Tier, SWE%, CTX, Model, Origin, Latest Ping, Avg Ping, Health, Verdict, Stability, Up%)
     const row = '  ' + num + '  ' + tier + '  ' + sweCell + '  ' + ctxCell + '  ' + nameCell + '  ' + sourceCell + '  ' + pingCell + '  ' + avgCell + '  ' + status + '  ' + speedCell + '  ' + stabCell + '  ' + uptimeCell
@@ -1256,7 +1281,12 @@ function renderTable(results, pendingPings, frame, cursor = null, sortColumn = '
   lines.push(chalk.dim(`  ↑↓ Navigate  •  `) + actionHint + chalk.dim(`  •  `) + chalk.yellow('F') + chalk.dim(` Favorite  •  R/Y/O/M/L/A/S/C/H/V/B/U Sort  •  `) + chalk.yellow('T') + chalk.dim(` Tier  •  `) + chalk.yellow('N') + chalk.dim(` Origin  •  W↓/X↑ (${intervalSec}s)  •  `) + chalk.rgb(255, 100, 50).bold('Z') + chalk.dim(` Mode  •  `) + chalk.yellow('P') + chalk.dim(` Settings  •  `) + chalk.rgb(0, 255, 80).bold('K') + chalk.dim(` Help`))
   // 📖 Line 2: profiles, recommend, feature request, bug report, and extended hints — gives visibility to less-obvious features
   lines.push(chalk.dim(`  `) + chalk.rgb(200, 150, 255).bold('⇧P') + chalk.dim(` Cycle profile  •  `) + chalk.rgb(200, 150, 255).bold('⇧S') + chalk.dim(` Save profile  •  `) + chalk.rgb(0, 200, 180).bold('Q') + chalk.dim(` Smart Recommend  •  `) + chalk.rgb(57, 255, 20).bold('J') + chalk.dim(` Request feature  •  `) + chalk.rgb(255, 87, 51).bold('I') + chalk.dim(` Report bug  •  `) + chalk.yellow('E') + chalk.dim(`/`) + chalk.yellow('D') + chalk.dim(` Tier ↑↓  •  `) + chalk.yellow('Esc') + chalk.dim(` Close overlay  •  Ctrl+C Exit`))
-  lines.push('')
+  // 📖 Proxy status line — shown when multi-account rotation proxy is active; empty otherwise
+  if (activeProxy) {
+    lines.push(chalk.dim('  ') + chalk.rgb(57, 255, 20)('🔀 Proxy') + chalk.dim(' running  •  multi-account rotation active'))
+  } else {
+    lines.push('')
+  }
   lines.push(
     chalk.rgb(255, 150, 200)('  Made with 💖 & ☕ by \x1b]8;;https://github.com/vava-nessa\x1b\\vava-nessa\x1b]8;;\x1b\\') +
     chalk.dim('  •  ') +
@@ -1604,25 +1634,6 @@ async function resolveOpenCodeTmuxPort() {
 
 function getOpenCodeConfigPath() {
   return OPENCODE_CONFIG
-}
-
-function loadOpenCodeConfig() {
-  const configPath = getOpenCodeConfigPath()
-  if (!existsSync(configPath)) return { provider: {} }
-  try {
-    return JSON.parse(readFileSync(configPath, 'utf8'))
-  } catch {
-    return { provider: {} }
-  }
-}
-
-function saveOpenCodeConfig(config) {
-  const configPath = getOpenCodeConfigPath()
-  const dir = dirname(configPath)
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true })
-  }
-  writeFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
 // ─── Shared OpenCode spawn helper ──────────────────────────────────────────────
@@ -2096,6 +2107,94 @@ async function startOpenCode(model, fcmConfig) {
     console.log()
 
     await spawnOpenCode(['--model', modelRef], providerKey, fcmConfig)
+  }
+}
+
+// ─── Proxy lifecycle (multi-account rotation) ─────────────────────────────────
+// 📖 Module-level proxy state — shared between startProxyAndLaunch, cleanupProxy, and renderTable.
+let activeProxy = null         // 📖 ProxyServer instance while proxy is running, null otherwise
+let proxyCleanedUp = false     // 📖 Guards against double-cleanup on concurrent exit signals
+let exitHandlersRegistered = false // 📖 Guards against registering handlers multiple times
+
+// 📖 cleanupProxy: Gracefully stops the active proxy server if one is running.
+// 📖 Called on OpenCode exit and on process exit signals.
+async function cleanupProxy() {
+  if (proxyCleanedUp || !activeProxy) return
+  proxyCleanedUp = true
+  const proxy = activeProxy
+  activeProxy = null
+  try {
+    await proxy.stop()
+  } catch { /* best-effort */ }
+}
+
+// 📖 registerExitHandlers: Ensures SIGINT/SIGTERM/exit handlers are registered exactly once.
+// 📖 Cleans up the proxy before the process exits so we don't leave a dangling HTTP server.
+function registerExitHandlers() {
+  if (exitHandlersRegistered) return
+  exitHandlersRegistered = true
+  const cleanup = () => { cleanupProxy().catch(() => {}) }
+  process.once('SIGINT',  cleanup)
+  process.once('SIGTERM', cleanup)
+  process.once('exit',    cleanup)
+}
+
+// 📖 startProxyAndLaunch: Starts ProxyServer with N accounts and launches OpenCode via fcm-proxy.
+// 📖 Falls back to the normal direct flow if the proxy cannot start.
+async function startProxyAndLaunch(model, accounts, fcmConfig) {
+  registerExitHandlers()
+  proxyCleanedUp = false
+
+  const proxy = new ProxyServer({ accounts })
+  try {
+    const port = await proxy.start()
+    activeProxy = proxy
+    console.log(chalk.dim(`  🔀 Multi-account proxy listening on port ${port} (${accounts.length} accounts)`))
+    await startOpenCodeWithProxy(model, port, model.modelId, accounts, fcmConfig)
+  } catch (err) {
+    console.error(chalk.red(`  ✗ Proxy failed to start: ${err.message}`))
+    console.log(chalk.dim('  Falling back to direct single-account flow…'))
+    await cleanupProxy()
+    await startOpenCode(model, fcmConfig)
+  }
+}
+
+// 📖 startOpenCodeWithProxy: Registers fcm-proxy provider in OpenCode config,
+// 📖 spawns OpenCode with that provider, then removes the ephemeral config after exit.
+async function startOpenCodeWithProxy(model, port, proxyModelId, accounts, fcmConfig) {
+  const config = loadOpenCodeConfig()
+  if (!config.provider) config.provider = {}
+
+  // 📖 Register ephemeral fcm-proxy provider pointing to our local proxy server
+  config.provider['fcm-proxy'] = {
+    npm: '@ai-sdk/openai-compatible',
+    name: 'FCM Proxy',
+    options: {
+      baseURL: `http://127.0.0.1:${port}/v1`,
+      apiKey: 'fcm-proxy-key'
+    },
+    models: {
+      [proxyModelId]: { name: model.label }
+    }
+  }
+  config.model = `fcm-proxy/${proxyModelId}`
+  saveOpenCodeConfig(config)
+
+  console.log(chalk.green(`  Setting ${chalk.bold(model.label)} via proxy as default for OpenCode…`))
+  console.log(chalk.dim(`  Model: fcm-proxy/${proxyModelId}  •  Proxy: http://127.0.0.1:${port}/v1`))
+  console.log()
+
+  try {
+    await spawnOpenCode(['--model', `fcm-proxy/${proxyModelId}`], 'fcm-proxy', fcmConfig)
+  } finally {
+    // 📖 Best-effort cleanup: remove fcm-proxy from opencode.json so stale config doesn't persist
+    try {
+      const savedCfg = loadOpenCodeConfig()
+      if (savedCfg.provider?.['fcm-proxy']) delete savedCfg.provider['fcm-proxy']
+      if (typeof savedCfg.model === 'string' && savedCfg.model.startsWith('fcm-proxy/')) delete savedCfg.model
+      saveOpenCodeConfig(savedCfg)
+    } catch { /* best-effort */ }
+    await cleanupProxy()
   }
 }
 
@@ -2841,6 +2940,8 @@ async function main() {
     bugReportBuffer: '',          // 📖 Typed characters for the bug report message
     bugReportStatus: 'idle',      // 📖 'idle'|'sending'|'success'|'error' — webhook send status
     bugReportError: null,         // 📖 Last webhook error message
+    // 📖 OpenCode sync status (S key in settings)
+    settingsSyncStatus: null,     // 📖 { type: 'success'|'error', msg: string } — shown in settings footer
   }
 
   // 📖 Re-clamp viewport on terminal resize
@@ -3021,7 +3122,12 @@ async function main() {
     if (state.settingsEditMode) {
       lines.push(chalk.dim('  Type API key  •  Enter Save  •  Esc Cancel'))
     } else {
-      lines.push(chalk.dim('  ↑↓ Navigate  •  Enter Edit key / Toggle / Load profile  •  Space Toggle  •  T Test key  •  U Updates  •  ⌫ Delete profile  •  Esc Close'))
+      lines.push(chalk.dim('  ↑↓ Navigate  •  Enter Edit key  •  + Add key  •  - Remove key  •  Space Toggle  •  T Test key  •  S Sync→OpenCode  •  R Restore backup  •  U Updates  •  ⌫ Delete profile  •  Esc Close'))
+    }
+    // 📖 Show sync/restore status message if set
+    if (state.settingsSyncStatus) {
+      const { type, msg } = state.settingsSyncStatus
+      lines.push(type === 'success' ? chalk.greenBright(`  ${msg}`) : chalk.yellow(`  ${msg}`))
     }
     lines.push('')
 
@@ -3964,6 +4070,7 @@ async function main() {
       if (key.name === 'escape' || key.name === 'p') {
         // 📖 Close settings — rebuild results to reflect provider changes
         state.settingsOpen = false
+        state.settingsSyncStatus = null  // 📖 Clear sync status on close
         // 📖 Rebuild results: add models from newly enabled providers, remove disabled
         results = MODELS
           .filter(([,,,,,pk]) => isProviderEnabled(state.config, pk))
@@ -4124,6 +4231,54 @@ async function main() {
       }
 
       if (key.ctrl && key.name === 'c') { exit(0); return }
+
+      // 📖 S key: sync FCM provider entries to OpenCode config (merge, don't replace)
+      if (key.name === 's' && !key.shift && !key.ctrl) {
+        try {
+          const proxyStatus = activeProxy?.getStatus?.()
+          const result = syncToOpenCode(state.config, sources, mergedModels, {
+            useProxy: !!activeProxy,
+            proxyPort: proxyStatus?.port,
+          })
+          state.settingsSyncStatus = { type: 'success', msg: `✅ Synced ${result.providersAdded} provider(s) to OpenCode` }
+        } catch (err) {
+          state.settingsSyncStatus = { type: 'error', msg: `❌ Sync failed: ${err.message}` }
+        }
+        return
+      }
+
+      // 📖 R key: restore OpenCode config from backup (opencode.json.bak)
+      if (key.name === 'r' && !key.shift && !key.ctrl) {
+        try {
+          const restored = restoreOpenCodeBackup()
+          state.settingsSyncStatus = restored
+            ? { type: 'success', msg: '✅ OpenCode config restored from backup' }
+            : { type: 'error', msg: '⚠  No backup found (opencode.json.bak)' }
+        } catch (err) {
+          state.settingsSyncStatus = { type: 'error', msg: `❌ Restore failed: ${err.message}` }
+        }
+        return
+      }
+
+      // 📖 + key: add/edit API key for the selected provider (alias for Enter on provider rows)
+      if ((str === '+' || key.name === '+') && state.settingsCursor < providerKeys.length) {
+        const pk = providerKeys[state.settingsCursor]
+        state.settingsEditBuffer = state.config.apiKeys?.[pk] ?? ''
+        state.settingsEditMode = true
+        return
+      }
+
+      // 📖 - key: remove API key for the selected provider
+      if ((str === '-' || key.name === '-') && state.settingsCursor < providerKeys.length) {
+        const pk = providerKeys[state.settingsCursor]
+        if (state.config.apiKeys) {
+          delete state.config.apiKeys[pk]
+          saveConfig(state.config)
+          state.settingsSyncStatus = { type: 'success', msg: `✅ Removed API key for ${pk}` }
+        }
+        return
+      }
+
       return // 📖 Swallow all other keys while settings is open
     }
 
@@ -4396,7 +4551,36 @@ async function main() {
       } else if (state.mode === 'opencode-desktop') {
         await startOpenCodeDesktop(userSelected, state.config)
       } else {
-        await startOpenCode(userSelected, state.config)
+        // 📖 Multi-account proxy: if the selected model is available on 2+ providers with API keys,
+        // 📖 build account list and start a rotation proxy. Fall back to direct flow if 0–1 accounts.
+        const merged = mergedModelByLabel.get(selected.label)
+        if (merged && merged.providerCount > 1) {
+          // 📖 Build accounts array: one entry per provider that has an API key configured
+          const accounts = []
+          for (const p of merged.providers) {
+            const keys = resolveApiKeys(state.config, p.providerKey)
+            const providerSource = sources[p.providerKey]
+            if (!providerSource) continue
+            // 📖 Resolve Cloudflare account_id placeholder, then strip trailing /chat/completions
+            const rawUrl = resolveCloudflareUrl(providerSource.url)
+            const baseUrl = rawUrl.replace(/\/chat\/completions$/, '')
+            for (const key of keys) {
+              accounts.push({ url: baseUrl, apiKey: key, modelId: p.modelId })
+            }
+          }
+          if (accounts.length === 0) {
+            console.log(chalk.yellow(`  No API keys found for any provider of ${selected.label}. Falling back to direct flow.`))
+            console.log()
+            await startOpenCode(userSelected, state.config)
+          } else if (accounts.length === 1) {
+            // 📖 Only one usable account — skip proxy overhead, use direct flow
+            await startOpenCode(userSelected, state.config)
+          } else {
+            await startProxyAndLaunch(userSelected, accounts, state.config)
+          }
+        } else {
+          await startOpenCode(userSelected, state.config)
+        }
       }
       process.exit(0)
     }
